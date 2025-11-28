@@ -194,8 +194,9 @@ uint64_t get_median_response_time(simple_networking::TCPClient* client, const st
 }
 
 // Count cache hits using Flush+Reload
-int count_cache_hits(simple_networking::TCPClient* client, const std::string& cookie, int num_samples) {
+int count_cache_hits(simple_networking::TCPClient* client, const std::string& cookie, int num_samples, bool debug = false) {
   int hit_count = 0;
+  std::vector<uint64_t> probe_times;
 
   for (int sample = 0; sample < num_samples; sample++) {
     flush(g_log_error_addr);
@@ -205,9 +206,18 @@ int count_cache_hits(simple_networking::TCPClient* client, const std::string& co
     client->ReadMessage();
 
     uint64_t t = probe_timing();
+    probe_times.push_back(t);
     if (t < g_cache_threshold) {
       hit_count++;
     }
+  }
+
+  if (debug) {
+    std::cout << "  Probe times: ";
+    for (auto t : probe_times) {
+      std::cout << t << " ";
+    }
+    std::cout << "(threshold=" << g_cache_threshold << ", hits=" << hit_count << ")" << std::endl;
   }
 
   return hit_count;
@@ -233,6 +243,22 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   client->SendMessage("get-cookie");
   std::string cookie = client->ReadMessage().ToString();
   std::cout << "[+] Got cookie: " << cookie << std::endl;
+
+  // Diagnostic: Test if Flush+Reload can distinguish valid vs invalid padding
+  std::cout << "[+] Testing Flush+Reload side channel..." << std::endl;
+
+  // Test with valid cookie (should NOT call LogError)
+  std::cout << "  Valid cookie (no LogError expected):" << std::endl;
+  count_cache_hits(client, cookie, 10, true);
+
+  // Test with corrupted cookie (should call LogError)
+  size_t dot = cookie.find('.');
+  std::string ct_part = cookie.substr(0, dot);
+  ByteVector corrupted_ct = base64::base64_decode(ct_part);
+  corrupted_ct[20] = static_cast<std::byte>(static_cast<uint8_t>(corrupted_ct[20]) ^ 0xFF);  // Corrupt a byte
+  std::string corrupted_cookie = base64::base64_encode(corrupted_ct) + cookie.substr(dot);
+  std::cout << "  Corrupted cookie (LogError expected):" << std::endl;
+  count_cache_hits(client, corrupted_cookie, 10, true);
 
   // Parse cookie format: <ciphertext_b64>.<hmac_b64>
   size_t dot_pos = cookie.find('.');
